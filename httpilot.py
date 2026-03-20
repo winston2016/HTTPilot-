@@ -592,6 +592,29 @@ class HTTPilot:
         return raw, "text/plain"
 
     # ── Autenticação na requisição ───────────────────────────
+    def _apply_auth_data(self, headers, params, body, t, data):
+        """Aplica auth usando dados puros (sem acessar widgets — seguro para threads)."""
+        if t == "basic":
+            cred = base64.b64encode(f"{data.get('username','')}:{data.get('password','')}".encode()).decode()
+            headers["Authorization"] = f"Basic {cred}"
+        elif t == "bearer":
+            headers["Authorization"] = f"Bearer {data.get('token', '')}"
+        elif t == "api_key":
+            name, val = data.get("key_name", ""), data.get("key_value", "")
+            if data.get("key_in", "header") == "header":
+                headers[name] = val
+            else:
+                params[name] = val
+        elif t == "digest":
+            return "digest"
+        elif t == "hmac_sha256":
+            secret = data.get("secret", "").encode()
+            payload = (body or "").encode()
+            sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+            h_name = data.get("header_name") or "X-Signature"
+            headers[h_name] = sig
+        return None
+
     def _apply_auth(self, headers, params, body):
         t = self.auth_type_var.get()
         w = self.auth_widgets
@@ -618,30 +641,38 @@ class HTTPilot:
 
     # ── Enviar ───────────────────────────────────────────────
     def _send_request(self):
-        self.status_label.configure(text="⏳ Enviando...", foreground=self.colors["yellow"])
-        threading.Thread(target=self._do_request, daemon=True).start()
+        # Captura todos os dados da UI na thread principal antes de iniciar a thread
+        method = self.method_var.get()
+        url = self.url_var.get().strip()
+        params = self._parse_params()
+        headers = self._parse_headers()
+        body, ct = self._get_body()
+        if ct and "Content-Type" not in headers:
+            headers["Content-Type"] = ct
 
-    def _do_request(self):
+        auth_type = self.auth_type_var.get()
+        auth_data = self._get_auth_data()
+
+        self.status_label.configure(text="⏳ Enviando...", foreground=self.colors["yellow"])
+        threading.Thread(
+            target=self._do_request,
+            args=(method, url, params, headers, body, auth_type, auth_data),
+            daemon=True
+        ).start()
+
+    def _do_request(self, method, url, params, headers, body, auth_type, auth_data):
         try:
-            method = self.method_var.get()
-            url = self.url_var.get().strip()
             if not url:
                 raise ValueError("URL vazia.")
 
-            params = self._parse_params()
-            headers = self._parse_headers()
-            body, ct = self._get_body()
-            if ct and "Content-Type" not in headers:
-                headers["Content-Type"] = ct
-
-            auth_flag = self._apply_auth(headers, params, body)
+            auth_flag = self._apply_auth_data(headers, params, body, auth_type, auth_data)
             kwargs = dict(method=method, url=url, headers=headers, params=params, timeout=30)
             if method in ("POST", "PUT", "PATCH"):
                 kwargs["data"] = body
             if auth_flag == "digest":
                 from requests.auth import HTTPDigestAuth
                 kwargs["auth"] = HTTPDigestAuth(
-                    self.auth_widgets["username"].get(), self.auth_widgets["password"].get())
+                    auth_data.get("username", ""), auth_data.get("password", ""))
 
             t0 = time.time()
             resp = requests.request(**kwargs)
